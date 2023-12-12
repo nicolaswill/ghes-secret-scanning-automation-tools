@@ -28,9 +28,23 @@ Run `go build` to build the CLI. You can then run the CLI using the snippet belo
 --new-pattern="YOUR_NEW_PATTERN_ID"
 --old-pattern="YOUR_OLD_PATTERN_ID"
 --reopen-alerts-csv-path="PATH_TO_CSV"
---dry-run="TRUE/FALSE"
+--dry-run="true/false"
 ```
 
-Either an input CSV path, or new and old patterns, or all three may be specified.
+### Options
+| Option                     | Description                                                            |
+|----------------------------|------------------------------------------------------------------------|
+| `--url value`              | GitHub instance API URL                                                |
+| `--dry-run`                | Enable dry run mode (default: false)                                   |
+| `--reopen-alerts-csv-path` | Path to a CSV file containing a list of alerts to reopen in owner,repo,alert-number format |
+| `--pat value`              | GitHub personal access token [$GITHUB_TOKEN]                           |
+| `--enterprise-name value`  | GitHub Enterprise name (default: "github")                             |
+| `--old-pattern value`      | Old secret scanning pattern name                                       |
+| `--new-pattern value`      | New secret-scanning pattern name                                       |
+| `--help, -h`               | show help                                                              |
+
+
+
+Either an input CSV path, both new and old patterns, or all three may be specified.
 
 Alternatively, specify your PAT via the `$GITHUB_TOKEN` env var.
