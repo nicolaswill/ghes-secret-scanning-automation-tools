@@ -364,8 +364,8 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, old
 
 func main() {
 	app := &cli.App{
-		Name:  "GitHub Orgs",
-		Usage: "List organizations from GitHub",
+		Name:  "GitHub Secret Scanning Automation",
+		Usage: "Automate reopening/resolving secret scanning alerts",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "url",
