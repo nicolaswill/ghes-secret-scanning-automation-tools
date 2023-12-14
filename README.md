@@ -20,29 +20,37 @@ To use this CLI you need:
 
 Run `go build` to build the CLI. You can then run the CLI using the snippet below:
 
+#### Enterprise-Wide:
 ```bash
 ./ghes-secret-scanning-script create \
 --url="YOUR_INSTANCE_URL" \
 --pat="YOUR_ADMIN_USER_PAT"
---enterprise-name="YOUR_ENTERPRISE_NAME"
+--enterprise-id="YOUR_ENTERPRISE_ID"
 --new-pattern="YOUR_NEW_PATTERN_ID"
 --old-pattern="YOUR_OLD_PATTERN_ID"
---reopen-alerts-csv-path="PATH_TO_CSV"
+--alerts-to-reopen-csv="PATH_TO_CSV"
 --dry-run="true/false"
 ```
 
-### Options
-| Option                     | Description                                                            |
-|----------------------------|------------------------------------------------------------------------|
-| `--url value`              | GitHub instance API URL                                                |
-| `--dry-run`                | Enable dry run mode (default: false)                                   |
-| `--reopen-alerts-csv-path` | Path to a CSV file containing a list of alerts to reopen in owner,repo,alert-number format |
-| `--pat value`              | GitHub personal access token [$GITHUB_TOKEN]                           |
-| `--enterprise-name value`  | GitHub Enterprise name (default: "github")                             |
-| `--old-pattern value`      | Old secret scanning pattern name                                       |
-| `--new-pattern value`      | New secret-scanning pattern name                                       |
-| `--help, -h`               | show help                                                              |
+#### Organization-Wide:
+Instead of specifying `--enterprise-id`, specify `--organization-ids` as a comma-delimited list of organization (e.g. `--organization-ids="org1,org2"`).
 
+#### Repository-Wide:
+Instead of specifying `--enterprise-id`, specify `--repository-ids` as a comma-delimited list of repositories in org/repo format (e.g. `--repository-ids="org1/repo1,org1/repo2,org2/repo1"`).
+
+### Options
+| Option                                              | Description                                                                                         |
+|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `--url value`                                       | Set the GitHub endpoint URL (default: "https://github.com/")                                        |
+| `--dry-run`                                         | Run without making changes (default: false)                                                         |
+| `--alerts-to-reopen-csv value`                      | CSV file path with alerts to reopen (owner, repo, alert number)                                     |
+| `--pat value`                                       | GitHub personal access token [$GITHUB_TOKEN]                                                        |
+| `--enterprise-id value`                             | Specify GitHub Enterprise identifier                                                                |
+| `--organization-ids value [ --organization-ids value ]` | Comma-delimited list of organization names                                                          |
+| `--repository-ids value [ --repository-ids value ]`     | Comma-delimited list of repository names in the format 'org/repo'                                   |
+| `--old-pattern value`                               | Specify old secret scanning pattern                                                                 |
+| `--new-pattern value`                               | Specify new secret scanning pattern                                                                 |
+| `--help, -h`                                        | show help                                                                                            |
 
 
 Either an input CSV path, both new and old patterns, or all three may be specified.
