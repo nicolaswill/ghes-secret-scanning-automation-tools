@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,20 +48,6 @@ type AlertDetails struct {
 
 // Map of repo name to alert details to alert.
 type RepoKeyToAlertDetailsToAlertMap map[RepoKey]map[AlertDetails]*github.SecretScanningAlert
-
-// Make a struct containing the secret scanning alert content, type, location, and path.
-func makeAlertDetails(alert *github.SecretScanningAlert, location *github.SecretScanningAlertLocation) AlertDetails {
-	return AlertDetails{
-		Secret:       alert.GetSecret(),
-		LocationType: location.GetType(),
-		CommitSHA:    location.GetDetails().GetCommitSHA(),
-		StartColumn:  location.GetDetails().GetStartColumn(),
-		EndColumn:    location.GetDetails().GetEndColumn(),
-		StartLine:    location.GetDetails().GetStartline(),
-		EndLine:      location.GetDetails().GetEndLine(),
-		Path:         location.GetDetails().GetPath(),
-	}
-}
 
 func makeAlertKey(alert *github.SecretScanningAlert) AlertKey {
 	return AlertKey{
@@ -118,10 +105,49 @@ func reopenClosedAlertsFromCSV(ctx context.Context, reopenAlertsCSVPath string, 
 	return nil
 }
 
-func getSecretScanningAlertLocations(ctx context.Context, client *github.Client, alertsByRepoName map[RepoKey][]*github.SecretScanningAlert, output RepoKeyToAlertDetailsToAlertMap) error {
+// Make a struct containing the secret scanning alert content, type, location, and path.
+// While doing so, run the substring regex and adjust the startline/endline based on the location of the substring within the original Secret.
+func makeAlertDetails(alert *github.SecretScanningAlert, location *github.SecretScanningAlertLocation, substringRegex *regexp.Regexp) AlertDetails {
+	secret := alert.GetSecret()
+
+	result := AlertDetails{
+		Secret:       secret,
+		LocationType: location.GetType(),
+		CommitSHA:    location.GetDetails().GetCommitSHA(),
+		StartColumn:  location.GetDetails().GetStartColumn(),
+		EndColumn:    location.GetDetails().GetEndColumn(),
+		StartLine:    location.GetDetails().GetStartline(),
+		EndLine:      location.GetDetails().GetEndLine(),
+		Path:         location.GetDetails().GetPath(),
+	}
+
+	if substringRegex != nil {
+		if location.GetDetails().GetStartline() != location.GetDetails().GetEndLine() {
+			log.Fatalf("Fatal: startline and endline are different for alert %s at location %s. Multiline alerts are not yet supported.\n", alert.GetHTMLURL(), location.GetDetails().GetBlobURL())
+		} else {
+			// get the string index of the first group of the regex
+			substringIndex := substringRegex.FindStringSubmatchIndex(secret)
+			if len(substringIndex) >= 4 && substringIndex[3]-substringIndex[2] > 0 {
+				result.EndColumn = substringIndex[3] + result.StartColumn
+				result.StartColumn += substringIndex[2]
+				result.Secret = secret[substringIndex[2]:substringIndex[3]]
+			}
+		}
+	}
+
+	return result
+}
+
+func getSecretScanningAlertLocations(ctx context.Context, secretSubstringRegex string, alertsByRepoName map[RepoKey][]*github.SecretScanningAlert, client *github.Client, output RepoKeyToAlertDetailsToAlertMap) error {
 	var wg sync.WaitGroup
 	var mutex sync.RWMutex
 	semaphore := make(chan struct{}, 64) // up to 64 concurrent goroutines
+
+	// compile the substring regex if it's not empty
+	var substringRegex *regexp.Regexp = nil
+	if secretSubstringRegex != "" {
+		substringRegex = regexp.MustCompile(secretSubstringRegex)
+	}
 
 	for repo, alerts := range alertsByRepoName {
 		for _, alert := range alerts {
@@ -141,7 +167,7 @@ func getSecretScanningAlertLocations(ctx context.Context, client *github.Client,
 						log.Printf("No locations found for alert %d\n", alert.GetNumber())
 					}
 					for _, location := range locations {
-						alertDetails := makeAlertDetails(alert, location)
+						alertDetails := makeAlertDetails(alert, location, substringRegex)
 						mutex.Lock()
 						if _, ok := output[repo]; !ok {
 							output[repo] = make(map[AlertDetails]*github.SecretScanningAlert)
@@ -253,7 +279,18 @@ func UpdateAlertInternal(ctx context.Context, client *github.Client, owner strin
 	return alert, resp, nil
 }
 
-func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, organizationIDs *[]string, repositoryIDs *[]string, oldPattern string, newPattern string, client *github.Client, dryRun bool) error {
+type AlertResolutionParams struct {
+	EnterpriseName           string
+	OrganizationIDs          *[]string
+	RepositoryIDs            *[]string
+	OldPattern               string
+	NewPattern               string
+	OldPatternSubstringRegex string
+	NewPatternSubstringRegex string
+	DryRun                   bool
+}
+
+func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionParams, client *github.Client) error {
 	// Populate repo->alert maps of the old and new pattern alerts.
 	// Specify the state as "resolved" for the old pattern and "open" for the new pattern.
 	oldPatternAlertsByRepoKey := make(map[RepoKey][]*github.SecretScanningAlert)
@@ -263,44 +300,44 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, org
 		ListCursorOptions: github.ListCursorOptions{PerPage: 100},
 		ListOptions:       github.ListOptions{PerPage: 100},
 		State:             "resolved",
-		SecretType:        oldPattern,
+		SecretType:        params.OldPattern,
 	}
 	newPatternOptions := github.SecretScanningAlertListOptions{
 		ListCursorOptions: github.ListCursorOptions{PerPage: 100},
 		ListOptions:       github.ListOptions{PerPage: 100},
 		State:             "open",
-		SecretType:        newPattern,
+		SecretType:        params.NewPattern,
 	}
 
 	// Get all alerts for the old and new patterns.
-	if enterpriseName != "" {
-		log.Printf("Getting alerts for enterprise %s\n", enterpriseName)
-		err := getEnterpriseSecretScanningAlerts(ctx, client, enterpriseName, oldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+	if params.EnterpriseName != "" {
+		log.Printf("Getting alerts for enterprise %s\n", params.EnterpriseName)
+		err := getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
 		if err != nil {
-			log.Fatalf("Error getting old pattern alerts for enterprise %s: %s\n", enterpriseName, err)
+			log.Fatalf("Error getting old pattern alerts for enterprise %s: %s\n", params.EnterpriseName, err)
 			return err
 		}
-		err = getEnterpriseSecretScanningAlerts(ctx, client, enterpriseName, newPattern, newPatternOptions, newPatternAlertsByRepoKey)
+		err = getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
 		if err != nil {
-			log.Fatalf("Error getting new pattern alerts for enterprise %s: %s\n", enterpriseName, err)
+			log.Fatalf("Error getting new pattern alerts for enterprise %s: %s\n", params.EnterpriseName, err)
 			return err
 		}
-	} else if len(*organizationIDs) > 0 {
-		for _, orgID := range *organizationIDs {
+	} else if len(*params.OrganizationIDs) > 0 {
+		for _, orgID := range *params.OrganizationIDs {
 			log.Printf("Getting alerts for organization %s\n", orgID)
-			err := getOrganizationSecretScanningAlerts(ctx, client, orgID, oldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+			err := getOrganizationSecretScanningAlerts(ctx, client, orgID, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
 			if err != nil {
 				log.Fatalf("Error getting old pattern alerts for organization %s: %s\n", orgID, err)
 				return err
 			}
-			err = getOrganizationSecretScanningAlerts(ctx, client, orgID, newPattern, newPatternOptions, newPatternAlertsByRepoKey)
+			err = getOrganizationSecretScanningAlerts(ctx, client, orgID, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
 			if err != nil {
 				log.Fatalf("Error getting new pattern alerts for organization %s: %s\n", orgID, err)
 				return err
 			}
 		}
-	} else if len(*repositoryIDs) > 0 {
-		for _, repoID := range *repositoryIDs {
+	} else if len(*params.RepositoryIDs) > 0 {
+		for _, repoID := range *params.RepositoryIDs {
 			splitRepoID := strings.Split(repoID, "/")
 			if len(splitRepoID) != 2 {
 				log.Fatalf("Error: repositoryID %s is invalid. Must be in the format owner/name\n", repoID)
@@ -310,12 +347,12 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, org
 
 			log.Printf("Getting alerts for repository %s\n", repoID)
 
-			err := getRepositorySecretScanningAlerts(ctx, client, repoKey, oldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+			err := getRepositorySecretScanningAlerts(ctx, client, repoKey, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
 			if err != nil {
 				log.Fatalf("Error getting old pattern alerts for repository %s: %s\n", repoID, err)
 				return err
 			}
-			err = getRepositorySecretScanningAlerts(ctx, client, repoKey, newPattern, newPatternOptions, newPatternAlertsByRepoKey)
+			err = getRepositorySecretScanningAlerts(ctx, client, repoKey, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
 			if err != nil {
 				log.Fatalf("Error getting new pattern alerts for repository %s: %s\n", repoID, err)
 				return err
@@ -341,16 +378,16 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, org
 	log.Printf("New pattern alert count: %d\n", newPatternAlertCount)
 
 	// Get the details/locations of the alerts for the old and new patterns.
-	oldAlertDetailsByRepo := make(map[RepoKey]map[AlertDetails]*github.SecretScanningAlert)
-	newAlertDetailsByRepo := make(map[RepoKey]map[AlertDetails]*github.SecretScanningAlert)
+	oldAlertDetailsByRepo := make(RepoKeyToAlertDetailsToAlertMap)
+	newAlertDetailsByRepo := make(RepoKeyToAlertDetailsToAlertMap)
 
-	err := getSecretScanningAlertLocations(ctx, client, oldPatternAlertsByRepoKey, oldAlertDetailsByRepo)
+	err := getSecretScanningAlertLocations(ctx, params.OldPatternSubstringRegex, oldPatternAlertsByRepoKey, client, oldAlertDetailsByRepo)
 	if err != nil {
 		log.Fatalf("Error getting old pattern alert details: %s\n", err)
 		return err
 	}
 
-	err = getSecretScanningAlertLocations(ctx, client, newPatternAlertsByRepoKey, newAlertDetailsByRepo)
+	err = getSecretScanningAlertLocations(ctx, params.NewPatternSubstringRegex, newPatternAlertsByRepoKey, client, newAlertDetailsByRepo)
 	if err != nil {
 		log.Fatalf("Error getting new pattern alert details: %s\n", err)
 		return err
@@ -403,7 +440,7 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, enterpriseName string, org
 	for newAlert, oldAlert := range alertsToResolve {
 		var operationStatus string
 		var operationError string
-		if dryRun {
+		if params.DryRun {
 			operationStatus = "Would have resolved"
 		} else {
 			operationStatus = "Resolved"
@@ -472,7 +509,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:     "enterprise-id",
-				Usage:    "Specify GitHub Enterprise identifier",
+				Usage:    "GitHub Enterprise identifier",
 				Required: false,
 			},
 			&cli.StringSliceFlag{
@@ -487,12 +524,22 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:     "old-pattern",
-				Usage:    "Specify old secret scanning pattern",
+				Usage:    "Old secret scanning pattern",
 				Required: false,
 			},
 			&cli.StringFlag{
 				Name:     "new-pattern",
-				Usage:    "Specify new secret scanning pattern",
+				Usage:    "New secret scanning pattern",
+				Required: false,
+			},
+			&cli.StringFlag{
+				Name:     "old-substring-regex",
+				Usage:    "Old secret substring regex used for correlating secret scanning alerts. WARNING: Does not support multi-line alerts.",
+				Required: false,
+			},
+			&cli.StringFlag{
+				Name:     "new-substring-regex",
+				Usage:    "New secret substring regex used for correlating secret scanning alerts. WARNING: Does not support multi-line alerts.",
 				Required: false,
 			},
 		},
@@ -506,6 +553,8 @@ func main() {
 			repositoryIDs := c.StringSlice("repository-ids")
 			oldSecretPattern := c.String("old-pattern")
 			newSecretPattern := c.String("new-pattern")
+			oldSubstringRegex := c.String("old-substring-regex")
+			newSubstringRegex := c.String("new-substring-regex")
 
 			// Ensure mutual exclusivity of enterprise, organization, and repository flags
 			levelCount := 0
@@ -536,6 +585,8 @@ func main() {
 			log.Printf("Repository Names: %v\n", repositoryIDs)
 			log.Printf("Old Secret Pattern: %s\n", oldSecretPattern)
 			log.Printf("New Secret Pattern: %s\n", newSecretPattern)
+			log.Printf("Old Substring Regex: %s\n", oldSubstringRegex)
+			log.Printf("New Substring Regex: %s\n", newSubstringRegex)
 
 			// Set up OAuth2 authentication with the token
 			ctx := context.Background()
@@ -573,7 +624,19 @@ func main() {
 			}
 
 			log.Printf("Beginning secret scanning pattern migration.\n")
-			err = resolveAlreadyTriagedAlerts(ctx, enterpriseId, &organizationIDs, &repositoryIDs, oldSecretPattern, newSecretPattern, client, dryRun)
+
+			resolutionParams := AlertResolutionParams{
+				EnterpriseName:           enterpriseId,
+				OrganizationIDs:          &organizationIDs,
+				RepositoryIDs:            &repositoryIDs,
+				OldPattern:               oldSecretPattern,
+				NewPattern:               newSecretPattern,
+				OldPatternSubstringRegex: oldSubstringRegex,
+				NewPatternSubstringRegex: newSubstringRegex,
+				DryRun:                   dryRun,
+			}
+
+			err = resolveAlreadyTriagedAlerts(ctx, resolutionParams, client)
 			if err == nil {
 				log.Printf("Finished secret scanning pattern migration.\n")
 			}
