@@ -504,7 +504,7 @@ func main() {
 			&cli.StringFlag{
 				Name:     "pat",
 				Usage:    "GitHub personal access token",
-				Required: false,
+				Required: true,
 				EnvVars:  []string{"GITHUB_TOKEN"},
 			},
 			&cli.StringFlag{
