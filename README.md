@@ -30,6 +30,8 @@ Run `go build` to build the CLI. You can then run the CLI using the snippet belo
 --old-pattern="YOUR_OLD_PATTERN_ID"
 --alerts-to-reopen-csv="PATH_TO_CSV"
 --dry-run="true/false"
+--new-substring-regex="REGEX"
+--old-substring-regex="REGEX"
 ```
 
 #### Organization-Wide:
@@ -39,18 +41,21 @@ Instead of specifying `--enterprise-id`, specify `--organization-ids` as a comma
 Instead of specifying `--enterprise-id`, specify `--repository-ids` as a comma-delimited list of repositories in org/repo format (e.g. `--repository-ids="org1/repo1,org1/repo2,org2/repo1"`).
 
 ### Options
-| Option                                              | Description                                                                                         |
-|-----------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `--url value`                                       | Set the GitHub endpoint URL (default: "https://github.com/")                                        |
-| `--dry-run`                                         | Run without making changes (default: false)                                                         |
-| `--alerts-to-reopen-csv value`                      | CSV file path with alerts to reopen (owner, repo, alert number)                                     |
-| `--pat value`                                       | GitHub personal access token [$GITHUB_TOKEN]                                                        |
-| `--enterprise-id value`                             | Specify GitHub Enterprise identifier                                                                |
-| `--organization-ids value [ --organization-ids value ]` | Comma-delimited list of organization names                                                          |
-| `--repository-ids value [ --repository-ids value ]`     | Comma-delimited list of repository names in the format 'org/repo'                                   |
-| `--old-pattern value`                               | Specify old secret scanning pattern                                                                 |
-| `--new-pattern value`                               | Specify new secret scanning pattern                                                                 |
-| `--help, -h`                                        | show help                                                                                            |
+| Option                                              | Description                                                                                                              |
+|-----------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `--url value`                                       | Set the GitHub endpoint URL (default: "https://github.com/")                                                             |
+| `--dry-run`                                         | Run without making changes (default: false)                                                                              |
+| `--alerts-to-reopen-csv value`                      | CSV file path with alerts to reopen (owner, repo, alert number)                                                          |
+| `--pat value`                                       | GitHub personal access token [$GITHUB_TOKEN]                                                                             |
+| `--enterprise-id value`                             | GitHub Enterprise identifier                                                                                             |
+| `--organization-ids value [ --organization-ids value ]` | Comma-delimited list of organization names                                                                               |
+| `--repository-ids value [ --repository-ids value ]`     | Comma-delimited list of repository names in the format 'org/repo'                                                        |
+| `--old-pattern value`                               | Old secret scanning pattern                                                                                              |
+| `--new-pattern value`                               | New secret scanning pattern                                                                                              |
+| `--old-substring-regex value`                       | Old secret substring regex used for correlating secret scanning alerts. WARNING: Does not support multi-line alerts.     |
+| `--new-substring-regex value`                       | New secret substring regex used for correlating secret scanning alerts. WARNING: Does not support multi-line alerts.     |
+| `--help, -h`                                        | show help                                                                                                                |
+
 
 
 Either an input CSV path, both new and old patterns, or all three may be specified.
