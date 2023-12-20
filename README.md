@@ -24,13 +24,13 @@ Run `go build` to build the CLI. You can then run the CLI using the snippet belo
 ```bash
 ./ghes-secret-scanning-script create \
 --url="YOUR_INSTANCE_URL" \
---pat="YOUR_ADMIN_USER_PAT"
---enterprise-id="YOUR_ENTERPRISE_ID"
---new-pattern="YOUR_NEW_PATTERN_ID"
---old-pattern="YOUR_OLD_PATTERN_ID"
---alerts-to-reopen-csv="PATH_TO_CSV"
---dry-run="true/false"
---new-substring-regex="REGEX"
+--pat="YOUR_ADMIN_USER_PAT" \
+--enterprise-id="YOUR_ENTERPRISE_ID" \
+--new-pattern="YOUR_NEW_PATTERN_ID" \
+--old-pattern="YOUR_OLD_PATTERN_ID" \
+--alerts-to-reopen-csv="PATH_TO_CSV" \
+--dry-run="true/false" \
+--new-substring-regex="REGEX" \
 --old-substring-regex="REGEX"
 ```
 
