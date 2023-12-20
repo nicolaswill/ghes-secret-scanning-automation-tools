@@ -43,7 +43,7 @@ Instead of specifying `--enterprise-id`, specify `--repository-ids` as a comma-d
 ### Options
 | Option                                              | Description                                                                                                              |
 |-----------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `--url value`                                       | Set the GitHub endpoint URL (default: "https://github.com/")                                                             |
+| `--url value`                                       | The GitHub endpoint URL (default: "https://github.com/")                                                             |
 | `--dry-run`                                         | Run without making changes (default: false)                                                                              |
 | `--alerts-to-reopen-csv value`                      | CSV file path with alerts to reopen (owner, repo, alert number)                                                          |
 | `--pat value`                                       | GitHub personal access token [$GITHUB_TOKEN]                                                                             |

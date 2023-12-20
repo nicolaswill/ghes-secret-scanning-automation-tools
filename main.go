@@ -487,7 +487,7 @@ func main() {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:     "url",
-				Usage:    "Set the GitHub endpoint URL",
+				Usage:    "The GitHub endpoint URL",
 				Value:    "https://github.com/",
 				Required: false,
 			},
