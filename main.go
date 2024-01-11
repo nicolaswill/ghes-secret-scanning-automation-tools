@@ -195,8 +195,10 @@ func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Clien
 			return err
 		}
 		for _, alert := range alerts {
-			repoKey := RepoKey{Owner: alert.GetRepository().GetOwner().GetLogin(), Name: alert.GetRepository().GetName()}
-			output[repoKey] = append(output[repoKey], alert)
+			if !alert.GetRepository().GetDisabled() {
+				repoKey := RepoKey{Owner: alert.GetRepository().GetOwner().GetLogin(), Name: alert.GetRepository().GetName()}
+				output[repoKey] = append(output[repoKey], alert)
+			}
 		}
 		if resp.After == "" {
 			break
