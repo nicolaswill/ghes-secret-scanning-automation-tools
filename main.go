@@ -203,6 +203,16 @@ func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Clien
 		}
 		opts.ListCursorOptions.After = resp.After
 	}
+
+	// Loop through all repos in the output and remove any that are disabled
+	for repoKey := range output {
+		_, resp, err := client.Repositories.Get(ctx, repoKey.Owner, repoKey.Name)
+		if err != nil && resp.StatusCode == 403 && strings.Contains(err.Error(), "Repository access blocked") {
+			log.Printf("Warning: repository %s/%s is disabled\n", repoKey.Owner, repoKey.Name)
+			delete(output, repoKey)
+		}
+	}
+
 	return nil
 }
 
