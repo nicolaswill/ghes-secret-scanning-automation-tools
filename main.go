@@ -28,12 +28,6 @@ type AlertKey struct {
 	Number int64
 }
 
-// An alertKey and its HTML URL string
-type AlertKeyAndURL struct {
-	AlertKey AlertKey
-	URL      string
-}
-
 // Secret scanning alert content, type, location, and path.
 type AlertDetails struct {
 	Secret       string
@@ -46,8 +40,15 @@ type AlertDetails struct {
 	Path         string
 }
 
-// Map of repo name to alert details to alert.
-type RepoKeyToAlertDetailsToAlertMap map[RepoKey]map[AlertDetails]*github.SecretScanningAlert
+type AlertState struct {
+	Key               AlertKey
+	URL               string
+	Resolution        string
+	ResolutionComment string
+}
+
+// Map of repo name to alert details to alert state
+type RepoKeyToAlertDetailsToAlertState map[RepoKey]map[AlertDetails]AlertState
 
 func makeAlertKey(alert *github.SecretScanningAlert) AlertKey {
 	return AlertKey{
@@ -105,45 +106,70 @@ func reopenClosedAlertsFromCSV(ctx context.Context, reopenAlertsCSVPath string, 
 	return nil
 }
 
-// Make a struct containing the secret scanning alert content, type, location, and path.
-// While doing so, run the substring regex and adjust the startline/endline based on the location of the substring within the original Secret.
-func makeAlertDetails(alert *github.SecretScanningAlert, location *github.SecretScanningAlertLocation, substringRegex *regexp.Regexp) AlertDetails {
-	secret := alert.GetSecret()
-
-	result := AlertDetails{
-		Secret:       secret,
-		LocationType: location.GetType(),
-		CommitSHA:    location.GetDetails().GetCommitSHA(),
-		StartColumn:  location.GetDetails().GetStartColumn(),
-		EndColumn:    location.GetDetails().GetEndColumn(),
-		StartLine:    location.GetDetails().GetStartline(),
-		EndLine:      location.GetDetails().GetEndLine(),
-		Path:         location.GetDetails().GetPath(),
-	}
-
+func adjustAlertDetailsWithSubstringRegex(substringRegex *regexp.Regexp, details *AlertDetails, state *AlertState) {
 	if substringRegex != nil {
-		if location.GetDetails().GetStartline() != location.GetDetails().GetEndLine() {
-			log.Fatalf("Fatal: startline and endline are different for alert %s at location %s. Multiline alerts are not yet supported.\n", alert.GetHTMLURL(), location.GetDetails().GetBlobURL())
+		if details.StartLine != details.EndLine {
+			log.Printf("Warning: startline and endline are different for alert %s. Multiline alerts are not yet supported.\n", state.URL)
 		} else {
 			// get the string index of the first group of the regex
-			substringIndex := substringRegex.FindStringSubmatchIndex(secret)
+			substringIndex := substringRegex.FindStringSubmatchIndex(details.Secret)
 			if len(substringIndex) >= 4 && substringIndex[3]-substringIndex[2] > 0 {
-				result.EndColumn = substringIndex[3] + result.StartColumn
-				result.StartColumn += substringIndex[2]
-				result.Secret = secret[substringIndex[2]:substringIndex[3]]
+				details.EndColumn = substringIndex[3] + details.StartColumn
+				details.StartColumn += substringIndex[2]
+				details.Secret = details.Secret[substringIndex[2]:substringIndex[3]]
 			}
 		}
+	}
+}
+
+// Make a struct containing the secret scanning alert content, type, location, and path.
+// While doing so, run the substring regex and adjust the startline/endline based on the location of the substring within the original Secret.
+func makeAlertDetails(alert *github.SecretScanningAlert, location *github.SecretScanningAlertLocation, substringRegex *regexp.Regexp, fuzzyMatching bool) AlertDetails {
+	var result AlertDetails
+
+	if fuzzyMatching {
+		result = AlertDetails{
+			Secret:       "",
+			LocationType: location.GetType(),
+			CommitSHA:    location.GetDetails().GetCommitSHA(),
+			StartColumn:  location.GetDetails().GetStartColumn(),
+			EndColumn:    location.GetDetails().GetEndColumn(),
+			StartLine:    location.GetDetails().GetStartline(),
+			EndLine:      location.GetDetails().GetEndLine(),
+			Path:         location.GetDetails().GetPath(),
+		}
+	} else {
+		result = AlertDetails{
+			Secret:       alert.GetSecret(),
+			LocationType: location.GetType(),
+			CommitSHA:    location.GetDetails().GetCommitSHA(),
+			StartColumn:  location.GetDetails().GetStartColumn(),
+			EndColumn:    location.GetDetails().GetEndColumn(),
+			StartLine:    location.GetDetails().GetStartline(),
+			EndLine:      location.GetDetails().GetEndLine(),
+			Path:         location.GetDetails().GetPath(),
+		}
+	}
+
+	if substringRegex != nil && !fuzzyMatching {
+		alertState := makeAlertState(alert)
+		adjustAlertDetailsWithSubstringRegex(substringRegex, &result, &alertState)
 	}
 
 	return result
 }
 
-func getSecretScanningAlertLocations(ctx context.Context, secretSubstringRegex string, alertsByRepoName map[RepoKey][]*github.SecretScanningAlert, client *github.Client, output RepoKeyToAlertDetailsToAlertMap) error {
+func makeAlertState(alert *github.SecretScanningAlert) AlertState {
+	return AlertState{Key: makeAlertKey(alert), URL: alert.GetHTMLURL(), Resolution: alert.GetResolution(), ResolutionComment: alert.GetResolutionComment()}
+}
+
+func getSecretScanningAlertLocations(ctx context.Context, client *github.Client, alertsByRepoName map[RepoKey][]*github.SecretScanningAlert, secretSubstringRegex string, fuzzyMatching bool) (RepoKeyToAlertDetailsToAlertState, error) {
+	output := make(RepoKeyToAlertDetailsToAlertState)
+
 	var wg sync.WaitGroup
 	var mutex sync.RWMutex
 	semaphore := make(chan struct{}, 64) // up to 64 concurrent goroutines
 
-	// compile the substring regex if it's not empty
 	var substringRegex *regexp.Regexp = nil
 	if secretSubstringRegex != "" {
 		substringRegex = regexp.MustCompile(secretSubstringRegex)
@@ -160,19 +186,19 @@ func getSecretScanningAlertLocations(ctx context.Context, secretSubstringRegex s
 				for {
 					locations, resp, err := client.SecretScanning.ListLocationsForAlert(ctx, repo.Owner, repo.Name, int64(alert.GetNumber()), &locationOpts)
 					if err != nil {
-						log.Fatalf("Error getting alert locations: %s\n", err)
 						return
 					}
 					if len(locations) == 0 {
 						log.Printf("No locations found for alert %d\n", alert.GetNumber())
 					}
 					for _, location := range locations {
-						alertDetails := makeAlertDetails(alert, location, substringRegex)
+						alertDetails := makeAlertDetails(alert, location, substringRegex, fuzzyMatching)
+						alertState := makeAlertState(alert)
 						mutex.Lock()
 						if _, ok := output[repo]; !ok {
-							output[repo] = make(map[AlertDetails]*github.SecretScanningAlert)
+							output[repo] = make(map[AlertDetails]AlertState)
 						}
-						output[repo][alertDetails] = alert
+						output[repo][alertDetails] = alertState
 						mutex.Unlock()
 					}
 					if resp.NextPage == 0 {
@@ -185,7 +211,7 @@ func getSecretScanningAlertLocations(ctx context.Context, secretSubstringRegex s
 	}
 
 	wg.Wait()
-	return nil
+	return output, nil
 }
 
 func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Client, enterpriseName string, pattern string, opts github.SecretScanningAlertListOptions, output map[RepoKey][]*github.SecretScanningAlert) error {
@@ -202,15 +228,6 @@ func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Clien
 			break
 		}
 		opts.ListCursorOptions.After = resp.After
-	}
-
-	// Loop through all repos in the output and remove any that are disabled
-	for repoKey := range output {
-		_, resp, err := client.Repositories.Get(ctx, repoKey.Owner, repoKey.Name)
-		if err != nil && resp.StatusCode == 403 && strings.Contains(err.Error(), "Repository access blocked") {
-			log.Printf("Warning: repository %s/%s is disabled\n", repoKey.Owner, repoKey.Name)
-			delete(output, repoKey)
-		}
 	}
 
 	return nil
@@ -290,146 +307,126 @@ func UpdateAlertInternal(ctx context.Context, client *github.Client, owner strin
 }
 
 type AlertResolutionParams struct {
-	EnterpriseName           string
-	OrganizationIDs          *[]string
-	RepositoryIDs            *[]string
-	OldPattern               string
-	NewPattern               string
-	OldPatternSubstringRegex string
-	NewPatternSubstringRegex string
-	DryRun                   bool
+	OldAlerts RepoKeyToAlertDetailsToAlertState
+	NewAlerts RepoKeyToAlertDetailsToAlertState
+	DryRun    bool
 }
 
-func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionParams, client *github.Client) error {
-	// Populate repo->alert maps of the old and new pattern alerts.
-	// Specify the state as "resolved" for the old pattern and "open" for the new pattern.
-	oldPatternAlertsByRepoKey := make(map[RepoKey][]*github.SecretScanningAlert)
-	newPatternAlertsByRepoKey := make(map[RepoKey][]*github.SecretScanningAlert)
+type AlertRetrievalParams struct {
+	EnterpriseName  string
+	OrganizationIDs *[]string
+	RepositoryIDs   *[]string
+	PatternID       string
+	AlertState      string
+	SubstringRegex  string
+	FuzzyMatching   bool
+}
 
-	oldPatternOptions := github.SecretScanningAlertListOptions{
+func retrieveAlertsAndLocations(ctx context.Context, params AlertRetrievalParams, client *github.Client) (RepoKeyToAlertDetailsToAlertState, error) {
+	alertsByRepoKey := make(map[RepoKey][]*github.SecretScanningAlert)
+
+	alertListOptions := github.SecretScanningAlertListOptions{
 		ListCursorOptions: github.ListCursorOptions{PerPage: 100},
 		ListOptions:       github.ListOptions{PerPage: 100},
-		State:             "resolved",
-		SecretType:        params.OldPattern,
-	}
-	newPatternOptions := github.SecretScanningAlertListOptions{
-		ListCursorOptions: github.ListCursorOptions{PerPage: 100},
-		ListOptions:       github.ListOptions{PerPage: 100},
-		State:             "open",
-		SecretType:        params.NewPattern,
+		State:             params.AlertState,
+		SecretType:        params.PatternID,
 	}
 
 	// Get all alerts for the old and new patterns.
 	if params.EnterpriseName != "" {
 		log.Printf("Getting alerts for enterprise %s\n", params.EnterpriseName)
-		err := getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+		err := getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.PatternID, alertListOptions, alertsByRepoKey)
 		if err != nil {
-			log.Fatalf("Error getting old pattern alerts for enterprise %s: %s\n", params.EnterpriseName, err)
-			return err
-		}
-		err = getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
-		if err != nil {
-			log.Fatalf("Error getting new pattern alerts for enterprise %s: %s\n", params.EnterpriseName, err)
-			return err
+			return nil, fmt.Errorf("error getting old pattern alerts for enterprise %s: %s", params.EnterpriseName, err)
 		}
 	} else if len(*params.OrganizationIDs) > 0 {
 		for _, orgID := range *params.OrganizationIDs {
 			log.Printf("Getting alerts for organization %s\n", orgID)
-			err := getOrganizationSecretScanningAlerts(ctx, client, orgID, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+			err := getOrganizationSecretScanningAlerts(ctx, client, orgID, params.PatternID, alertListOptions, alertsByRepoKey)
 			if err != nil {
-				log.Fatalf("Error getting old pattern alerts for organization %s: %s\n", orgID, err)
-				return err
-			}
-			err = getOrganizationSecretScanningAlerts(ctx, client, orgID, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
-			if err != nil {
-				log.Fatalf("Error getting new pattern alerts for organization %s: %s\n", orgID, err)
-				return err
+				return nil, fmt.Errorf("error getting old pattern alerts for organization %s: %s", orgID, err)
 			}
 		}
 	} else if len(*params.RepositoryIDs) > 0 {
 		for _, repoID := range *params.RepositoryIDs {
 			splitRepoID := strings.Split(repoID, "/")
 			if len(splitRepoID) != 2 {
-				log.Fatalf("Error: repositoryID %s is invalid. Must be in the format owner/name\n", repoID)
-				return nil
+				return nil, fmt.Errorf("repositoryID %s is invalid. Must be in the format owner/name", repoID)
 			}
 			repoKey := RepoKey{Owner: splitRepoID[0], Name: splitRepoID[1]}
-
 			log.Printf("Getting alerts for repository %s\n", repoID)
-
-			err := getRepositorySecretScanningAlerts(ctx, client, repoKey, params.OldPattern, oldPatternOptions, oldPatternAlertsByRepoKey)
+			err := getRepositorySecretScanningAlerts(ctx, client, repoKey, params.PatternID, alertListOptions, alertsByRepoKey)
 			if err != nil {
-				log.Fatalf("Error getting old pattern alerts for repository %s: %s\n", repoID, err)
-				return err
-			}
-			err = getRepositorySecretScanningAlerts(ctx, client, repoKey, params.NewPattern, newPatternOptions, newPatternAlertsByRepoKey)
-			if err != nil {
-				log.Fatalf("Error getting new pattern alerts for repository %s: %s\n", repoID, err)
-				return err
+				return nil, fmt.Errorf("error getting old pattern alerts for repository %s: %s", repoID, err)
 			}
 		}
 	} else {
-		// Should never happen
-		log.Fatalf("Error: enterpriseName, organizationIDs, and repositoryIDs cannot all be empty\n")
-		return nil
+		return nil, fmt.Errorf("enterpriseName, organizationIDs, and repositoryIDs cannot all be empty")
+	}
+
+	// Loop through all repos in the output and remove any that are disabled
+	for repoKey := range alertsByRepoKey {
+		_, resp, err := client.Repositories.Get(ctx, repoKey.Owner, repoKey.Name)
+		if err != nil && resp.StatusCode == 403 && strings.Contains(err.Error(), "Repository access blocked") {
+			log.Printf("Warning: repository %s/%s is disabled\n", repoKey.Owner, repoKey.Name)
+			delete(alertsByRepoKey, repoKey)
+		}
 	}
 
 	// Count the number of old and new alerts in each map and print the results.
-	oldPatternAlertCount := 0
-	for _, alerts := range oldPatternAlertsByRepoKey {
-		oldPatternAlertCount += len(alerts)
+	alertCount := 0
+	for _, alerts := range alertsByRepoKey {
+		alertCount += len(alerts)
 	}
-	log.Printf("Old pattern alert count: %d\n", oldPatternAlertCount)
+	log.Printf("Retrieved %d alerts for pattern %s\n", alertCount, params.PatternID)
 
-	newPatternAlertCount := 0
-	for _, alerts := range newPatternAlertsByRepoKey {
-		newPatternAlertCount += len(alerts)
-	}
-	log.Printf("New pattern alert count: %d\n", newPatternAlertCount)
-
-	// Get the details/locations of the alerts for the old and new patterns.
-	oldAlertDetailsByRepo := make(RepoKeyToAlertDetailsToAlertMap)
-	newAlertDetailsByRepo := make(RepoKeyToAlertDetailsToAlertMap)
-
-	err := getSecretScanningAlertLocations(ctx, params.OldPatternSubstringRegex, oldPatternAlertsByRepoKey, client, oldAlertDetailsByRepo)
+	// Retrieve the details/locations of the alerts
+	alertDetailsByRepo, err := getSecretScanningAlertLocations(ctx, client, alertsByRepoKey, params.SubstringRegex, params.FuzzyMatching)
 	if err != nil {
-		log.Fatalf("Error getting old pattern alert details: %s\n", err)
-		return err
+		return nil, fmt.Errorf("error getting alert details: %s", err)
 	}
+	return alertDetailsByRepo, nil
+}
 
-	err = getSecretScanningAlertLocations(ctx, params.NewPatternSubstringRegex, newPatternAlertsByRepoKey, client, newAlertDetailsByRepo)
-	if err != nil {
-		log.Fatalf("Error getting new pattern alert details: %s\n", err)
-		return err
-	}
+type AlertResolutionInfo struct {
+	NewAlert        AlertKey
+	NewAlertDetails AlertDetails
+	OldAlertDetails AlertDetails
+}
 
+func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionParams, client *github.Client) error {
 	oldPatternAlertLocationCount := 0
 	newPatternAlertLocationCount := 0
 
-	for _, alerts := range oldAlertDetailsByRepo {
+	for _, alerts := range params.OldAlerts {
 		oldPatternAlertLocationCount += len(alerts)
 	}
 
-	for _, alerts := range newAlertDetailsByRepo {
+	for _, alerts := range params.NewAlerts {
 		newPatternAlertLocationCount += len(alerts)
 	}
 
 	log.Printf("Processing %d old pattern locations\n", oldPatternAlertLocationCount)
 	log.Printf("Processing %d new pattern locations\n", newPatternAlertLocationCount)
 
-	// Correlate the old and new pattern alerts by repo, location, and secret.
-	// If the same location/secret is found in the same repo both maps, resolve the new alert.
-	// If the same location/secret is not found in the same repo in both maps, the alert is new and should not be resolved.
-	alertsToResolve := make(map[AlertKeyAndURL]*github.SecretScanningAlert)
-
-	for repo, oldAlertsByDetails := range oldAlertDetailsByRepo {
-		// If the old alert repo has new pattern alert locations, process it.
-		if newAlertsByDetails, ok := newAlertDetailsByRepo[repo]; ok {
-			// Correlate old locations to new locations and add the new alerts to the alertsToResolve map.
-			for oldAlertDetails, oldAlert := range oldAlertsByDetails {
-				if newAlert, ok := newAlertsByDetails[oldAlertDetails]; ok {
-					alertKeyAndUrl := AlertKeyAndURL{AlertKey: makeAlertKey(newAlert), URL: newAlert.GetHTMLURL()}
-					alertsToResolve[alertKeyAndUrl] = oldAlert
+	// Correlate the old and new pattern alerts by repo and details:
+	// If the same repo and details are found in both maps, resolve the new alert.
+	// If the same repo and details are NOT found in both maps, the alert is new and should not be resolved.
+	type AlertResolutionInfo struct {
+		NewAlert       AlertState
+		OldAlertState  AlertState
+		NewAlertSecret string
+		OldAlertSecret string
+	}
+	alertsToResolve := make(map[AlertKey]AlertResolutionInfo)
+	for repo, oldAlertStateByDetails := range params.OldAlerts {
+		// If the old alert repo has new pattern alert details, process it.
+		if newAlertStateByDetails, ok := params.NewAlerts[repo]; ok {
+			// Correlate old details to new details and add the new alerts to the alertsToResolve map.
+			for oldAlertDetails, oldAlertState := range oldAlertStateByDetails {
+				if newAlertState, ok := newAlertStateByDetails[oldAlertDetails]; ok {
+					info := AlertResolutionInfo{NewAlert: newAlertState, NewAlertSecret: oldAlertDetails.Secret, OldAlertState: oldAlertState, OldAlertSecret: oldAlertDetails.Secret}
+					alertsToResolve[oldAlertState.Key] = info
 				}
 			}
 		}
@@ -447,47 +444,179 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	for newAlert, oldAlert := range alertsToResolve {
-		var operationStatus string
-		var operationError string
-		if params.DryRun {
-			operationStatus = "Would have resolved"
-		} else {
-			operationStatus = "Resolved"
-			oldResolution := oldAlert.GetResolution()
-			oldResolutionComment := oldAlert.GetResolutionComment()
-			opts := SecretScanningAlertUpdateOptionsInternal{
-				State:             oldAlert.GetState(),
-				Resolution:        &oldResolution,
-				ResolutionComment: &oldResolutionComment,
-			}
-			_, _, err := UpdateAlertInternal(
-				ctx,
-				client,
-				newAlert.AlertKey.Repo.Owner,
-				newAlert.AlertKey.Repo.Name,
-				newAlert.AlertKey.Number,
-				&opts,
-			)
-			if err != nil {
-				operationError = err.Error()
-			}
-		}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-		// Write the action to the CSV file.
-		record := []string{
-			newAlert.URL,
-			oldAlert.GetHTMLURL(),
-			operationStatus,
-			operationError,
-		}
-		if err := writer.Write(record); err != nil {
-			log.Fatalf("Error writing to CSV output file: %s\n", err)
-			return err
+	semaphore := make(chan struct{}, 64)
+
+	for _, info := range alertsToResolve {
+		wg.Add(1)
+		semaphore <- struct{}{}
+		go func(info AlertResolutionInfo) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			var operationStatus string
+			var operationError string
+			if params.DryRun {
+				operationStatus = "Would have resolved"
+			} else {
+				operationStatus = "Resolved"
+				opts := SecretScanningAlertUpdateOptionsInternal{
+					State:             "resolved",
+					Resolution:        &info.OldAlertState.Resolution,
+					ResolutionComment: &info.OldAlertState.ResolutionComment,
+				}
+				_, _, err := UpdateAlertInternal(
+					ctx,
+					client,
+					info.NewAlert.Key.Repo.Owner,
+					info.NewAlert.Key.Repo.Name,
+					info.NewAlert.Key.Number,
+					&opts,
+				)
+				if err != nil {
+					operationError = err.Error()
+				}
+			}
+
+			record := []string{
+				info.NewAlertSecret,
+				info.NewAlert.URL,
+				info.OldAlertSecret,
+				info.OldAlertState.URL,
+				operationStatus,
+				operationError,
+			}
+			mu.Lock()
+			if err := writer.Write(record); err != nil {
+				log.Fatalf("Error writing to CSV output file: %s\n", err)
+			}
+			mu.Unlock()
+		}(info)
+	}
+
+	wg.Wait()
+
+	return nil
+}
+
+func writeAlertsToCSV(alertsByRepoKey RepoKeyToAlertDetailsToAlertState, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("error creating CSV output file: %s", err)
+	}
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	for repoKey, alerts := range alertsByRepoKey {
+		for details, state := range alerts {
+			record := []string{
+				repoKey.Owner,                           // 1
+				repoKey.Name,                            // 2
+				details.Secret,                          // 3
+				details.CommitSHA,                       // 4
+				details.Path,                            // 5
+				strconv.Itoa(details.StartLine),         // 6
+				strconv.Itoa(details.EndLine),           // 7
+				strconv.Itoa(details.StartColumn),       // 8
+				strconv.Itoa(details.EndColumn),         // 9
+				details.LocationType,                    // 10
+				strconv.FormatInt(state.Key.Number, 10), // 11
+				state.URL,                               // 12
+				state.Resolution,                        // 13
+				state.ResolutionComment,                 // 14
+			}
+			if err := writer.Write(record); err != nil {
+				return fmt.Errorf("could not write to CSV output file: %s", err)
+			}
 		}
 	}
 
 	return nil
+}
+
+func readAlertsFromCSV(filename string, fuzzyMatching bool, substringRegexStr string) (RepoKeyToAlertDetailsToAlertState, error) {
+	alertsByRepoKey := make(RepoKeyToAlertDetailsToAlertState)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("could not open CSV input file: %s", err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = 14
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("error reading CSV input file: %s", err)
+	}
+
+	// compile the regex
+	var substringRegex *regexp.Regexp
+	if !fuzzyMatching {
+		substringRegex, err = regexp.Compile(substringRegexStr)
+		if err != nil {
+			return nil, fmt.Errorf("error compiling substring regex: %s", err)
+		}
+	}
+
+	for _, record := range records {
+		atoi := func(s string) int {
+			i, err := strconv.Atoi(s)
+			if err != nil {
+				panic(err)
+			}
+			return i
+		}
+		repoKey := RepoKey{
+			Owner: record[0],
+			Name:  record[1],
+		}
+		details := AlertDetails{
+			Secret:       record[2],
+			CommitSHA:    record[3],
+			Path:         record[4],
+			StartLine:    atoi(record[5]),
+			EndLine:      atoi(record[6]),
+			StartColumn:  atoi(record[7]),
+			EndColumn:    atoi(record[8]),
+			LocationType: record[9],
+		}
+		state := AlertState{
+			Key: AlertKey{
+				Number: int64(atoi(record[10])),
+				Repo: RepoKey{
+					Owner: repoKey.Owner,
+					Name:  repoKey.Name,
+				},
+			},
+			URL:               record[11],
+			Resolution:        record[12],
+			ResolutionComment: record[13],
+		}
+
+		if fuzzyMatching {
+			details.Secret = ""
+		} else if substringRegex != nil {
+			adjustAlertDetailsWithSubstringRegex(substringRegex, &details, &state)
+		}
+
+		if _, ok := alertsByRepoKey[repoKey]; !ok {
+			alertsByRepoKey[repoKey] = make(map[AlertDetails]AlertState)
+		}
+		alertsByRepoKey[repoKey][details] = state
+	}
+
+	// log number of alerts read
+	alertCount := 0
+	for _, alerts := range alertsByRepoKey {
+		alertCount += len(alerts)
+	}
+	log.Printf("Read %d alerts/locations from %s\n", alertCount, filename)
+
+	return alertsByRepoKey, nil
 }
 
 func main() {
@@ -505,11 +634,6 @@ func main() {
 				Name:  "dry-run",
 				Value: false,
 				Usage: "Run without making changes",
-			},
-			&cli.PathFlag{
-				Name:     "alerts-to-reopen-csv",
-				Usage:    "CSV file path with alerts to reopen (owner, repo, alert number)",
-				Required: false,
 			},
 			&cli.StringFlag{
 				Name:     "pat",
@@ -552,12 +676,31 @@ func main() {
 				Usage:    "New secret substring regex used for correlating secret scanning alerts. WARNING: Does not support multi-line alerts.",
 				Required: false,
 			},
+			&cli.BoolFlag{
+				Name:  "fuzzy",
+				Value: false,
+				Usage: "Enable fuzzy matching for alert correlation",
+			},
+			&cli.BoolFlag{
+				Name:  "output-old-alerts",
+				Value: false,
+				Usage: "Output old alerts to a CSV file for further processing",
+			},
+			&cli.PathFlag{
+				Name:     "old-alerts-csv",
+				Usage:    "CSV file path of old alerts to use as an input, or if output-old-alerts is specified, as an output path",
+				Required: false,
+			},
+			&cli.PathFlag{
+				Name:     "alerts-to-reopen-csv",
+				Usage:    "CSV file path with alerts to reopen (owner, repo, alert number)",
+				Required: false,
+			},
 		},
 		Action: func(c *cli.Context) error {
 			apiUrl := c.String("url")
 			dryRun := c.Bool("dry-run")
 			pat := c.String("pat")
-			alertsCsv := c.Path("alerts-to-reopen-csv")
 			enterpriseId := c.String("enterprise-id")
 			organizationIDs := c.StringSlice("organization-ids")
 			repositoryIDs := c.StringSlice("repository-ids")
@@ -565,6 +708,10 @@ func main() {
 			newSecretPattern := c.String("new-pattern")
 			oldSubstringRegex := c.String("old-substring-regex")
 			newSubstringRegex := c.String("new-substring-regex")
+			fuzzyMatching := c.Bool("fuzzy")
+			outputOldAlerts := c.Bool("output-old-alerts")
+			oldAlertsCsv := c.Path("old-alerts-csv")
+			alertsCsv := c.Path("alerts-to-reopen-csv")
 
 			// Ensure mutual exclusivity of enterprise, organization, and repository flags
 			levelCount := 0
@@ -587,9 +734,14 @@ func main() {
 				return nil
 			}
 
+			// Do not allow old and new secret patterns to be the same
+			if oldSecretPattern == newSecretPattern {
+				log.Fatalf("Old and new secret patterns cannot be the same.")
+				return nil
+			}
+
 			log.Printf("API URL: %s\n", apiUrl)
 			log.Printf("Dry Run: %v\n", dryRun)
-			log.Printf("Alerts CSV Path: %s\n", alertsCsv)
 			log.Printf("Enterprise ID: %s\n", enterpriseId)
 			log.Printf("Organization Names: %v\n", organizationIDs)
 			log.Printf("Repository Names: %v\n", repositoryIDs)
@@ -597,13 +749,16 @@ func main() {
 			log.Printf("New Secret Pattern: %s\n", newSecretPattern)
 			log.Printf("Old Substring Regex: %s\n", oldSubstringRegex)
 			log.Printf("New Substring Regex: %s\n", newSubstringRegex)
+			log.Printf("Fuzzy Matching: %v\n", fuzzyMatching)
+			log.Printf("Output Old Alerts: %v\n", outputOldAlerts)
+			log.Printf("Old Alerts CSV Path: %s\n", oldAlertsCsv)
+			log.Printf("Alerts CSV Path: %s\n", alertsCsv)
 
-			// Set up OAuth2 authentication with the token
+			// Setup the client
 			ctx := context.Background()
 			ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: pat})
 			tc := oauth2.NewClient(ctx, ts)
 
-			// Parse the URL and create a new GitHub client
 			baseURL, err := url.Parse(apiUrl)
 			if err != nil {
 				log.Fatalf("Error parsing URL: %s\n", err)
@@ -616,6 +771,7 @@ func main() {
 				return err
 			}
 
+			// Process the alerts-to-reopen CSV
 			if alertsCsv != "" {
 				log.Printf("Beginning secret scanning alert reopening.\n")
 				err := reopenClosedAlertsFromCSV(ctx, alertsCsv, dryRun, client)
@@ -628,22 +784,88 @@ func main() {
 				log.Printf("Alert CSV input path not specified, skipping secret scanning alert reopening.\n")
 			}
 
-			if oldSecretPattern == "" || newSecretPattern == "" {
-				log.Printf("Old secret pattern and new secret pattern not specified, skipping secret scanning pattern migration.\n")
+			// Process secret scanning patterns
+			// Three modes of operation:
+			// 1. Output old alerts to CSV and return
+			// 2. Populate old alerts from CSV and migrate to new pattern
+			// 3. Retrieve old alerts from GitHub and migrate to new pattern
+			if oldSecretPattern == "" {
+				log.Printf("Old secret pattern not specified, skipping secret scanning pattern migration.\n")
 				return nil
+			}
+
+			oldAlertRetrievalParams := AlertRetrievalParams{
+				EnterpriseName:  enterpriseId,
+				OrganizationIDs: &organizationIDs,
+				RepositoryIDs:   &repositoryIDs,
+				PatternID:       oldSecretPattern,
+				SubstringRegex:  oldSubstringRegex,
+				FuzzyMatching:   fuzzyMatching,
+				AlertState:      "resolved",
+			}
+
+			if err != nil {
+				log.Fatalf("Error retrieving old alerts: %s\n", err)
+				return err
+			}
+
+			var oldAlerts RepoKeyToAlertDetailsToAlertState
+
+			// Mode 1: Output old alerts to CSV
+			if outputOldAlerts {
+				oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
+				if err != nil {
+					return err
+				}
+				if oldAlertsCsv == "" {
+					return fmt.Errorf("output old alerts specified, but old-alerts-csv not specified")
+				}
+				log.Printf("Outputting old alerts to CSV.\n")
+				return writeAlertsToCSV(oldAlerts, oldAlertsCsv)
+			}
+
+			// Mode 2: Populate old alerts from CSV
+			if newSecretPattern == "" {
+				return fmt.Errorf("new secret pattern not specified, skipping secret scanning pattern migration")
 			}
 
 			log.Printf("Beginning secret scanning pattern migration.\n")
 
+			if oldAlertsCsv != "" {
+				log.Printf("Populating old alerts from CSV.\n")
+				oldAlerts, err = readAlertsFromCSV(oldAlertsCsv, fuzzyMatching, oldSubstringRegex)
+				if err != nil {
+					return err
+				}
+			} else {
+				oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
+				if err != nil {
+					return err
+				}
+			}
+
+			// Mode 3: Retrieve old alerts from GitHub
+			newAlertRetrievealParams := AlertRetrievalParams{
+				EnterpriseName:  enterpriseId,
+				OrganizationIDs: &organizationIDs,
+				RepositoryIDs:   &repositoryIDs,
+				PatternID:       newSecretPattern,
+				SubstringRegex:  newSubstringRegex,
+				FuzzyMatching:   fuzzyMatching,
+				AlertState:      "open",
+			}
+
+			var newAlerts RepoKeyToAlertDetailsToAlertState
+			newAlerts, err = retrieveAlertsAndLocations(ctx, newAlertRetrievealParams, client)
+
+			if err != nil {
+				return err
+			}
+
 			resolutionParams := AlertResolutionParams{
-				EnterpriseName:           enterpriseId,
-				OrganizationIDs:          &organizationIDs,
-				RepositoryIDs:            &repositoryIDs,
-				OldPattern:               oldSecretPattern,
-				NewPattern:               newSecretPattern,
-				OldPatternSubstringRegex: oldSubstringRegex,
-				NewPatternSubstringRegex: newSubstringRegex,
-				DryRun:                   dryRun,
+				OldAlerts: oldAlerts,
+				NewAlerts: newAlerts,
+				DryRun:    dryRun,
 			}
 
 			err = resolveAlreadyTriagedAlerts(ctx, resolutionParams, client)
