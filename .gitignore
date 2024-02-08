@@ -22,4 +22,4 @@ ghes-secret-scanning-script
 go.work
 
 # Run output
-resolved_alerts.csv
+*.csv
