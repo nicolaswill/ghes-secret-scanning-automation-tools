@@ -45,6 +45,7 @@ type AlertState struct {
 	URL               string
 	Resolution        string
 	ResolutionComment string
+	Secret            string
 }
 
 // Map of repo name to alert details to alert state
@@ -160,7 +161,7 @@ func makeAlertDetails(alert *github.SecretScanningAlert, location *github.Secret
 }
 
 func makeAlertState(alert *github.SecretScanningAlert) AlertState {
-	return AlertState{Key: makeAlertKey(alert), URL: alert.GetHTMLURL(), Resolution: alert.GetResolution(), ResolutionComment: alert.GetResolutionComment()}
+	return AlertState{Key: makeAlertKey(alert), URL: alert.GetHTMLURL(), Resolution: alert.GetResolution(), ResolutionComment: alert.GetResolutionComment(), Secret: alert.GetSecret()}
 }
 
 func getSecretScanningAlertLocations(ctx context.Context, client *github.Client, alertsByRepoName map[RepoKey][]*github.SecretScanningAlert, secretSubstringRegex string, fuzzyMatching bool) (RepoKeyToAlertDetailsToAlertState, error) {
@@ -388,12 +389,6 @@ func retrieveAlertsAndLocations(ctx context.Context, params AlertRetrievalParams
 	return alertDetailsByRepo, nil
 }
 
-type AlertResolutionInfo struct {
-	NewAlert        AlertKey
-	NewAlertDetails AlertDetails
-	OldAlertDetails AlertDetails
-}
-
 func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionParams, client *github.Client) error {
 	oldPatternAlertLocationCount := 0
 	newPatternAlertLocationCount := 0
@@ -413,10 +408,8 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 	// If the same repo and details are found in both maps, resolve the new alert.
 	// If the same repo and details are NOT found in both maps, the alert is new and should not be resolved.
 	type AlertResolutionInfo struct {
-		NewAlert       AlertState
-		OldAlertState  AlertState
-		NewAlertSecret string
-		OldAlertSecret string
+		NewAlert AlertState
+		OldAlert AlertState
 	}
 	alertsToResolve := make(map[AlertKey]AlertResolutionInfo)
 	for repo, oldAlertStateByDetails := range params.OldAlerts {
@@ -425,7 +418,7 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 			// Correlate old details to new details and add the new alerts to the alertsToResolve map.
 			for oldAlertDetails, oldAlertState := range oldAlertStateByDetails {
 				if newAlertState, ok := newAlertStateByDetails[oldAlertDetails]; ok {
-					info := AlertResolutionInfo{NewAlert: newAlertState, NewAlertSecret: oldAlertDetails.Secret, OldAlertState: oldAlertState, OldAlertSecret: oldAlertDetails.Secret}
+					info := AlertResolutionInfo{NewAlert: newAlertState, OldAlert: oldAlertState}
 					alertsToResolve[oldAlertState.Key] = info
 				}
 			}
@@ -464,8 +457,8 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 				operationStatus = "Resolved"
 				opts := SecretScanningAlertUpdateOptionsInternal{
 					State:             "resolved",
-					Resolution:        &info.OldAlertState.Resolution,
-					ResolutionComment: &info.OldAlertState.ResolutionComment,
+					Resolution:        &info.OldAlert.Resolution,
+					ResolutionComment: &info.OldAlert.ResolutionComment,
 				}
 				_, _, err := UpdateAlertInternal(
 					ctx,
@@ -481,10 +474,10 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 			}
 
 			record := []string{
-				info.NewAlertSecret,
+				info.NewAlert.Secret,
 				info.NewAlert.URL,
-				info.OldAlertSecret,
-				info.OldAlertState.URL,
+				info.OldAlert.Secret,
+				info.OldAlert.URL,
 				operationStatus,
 				operationError,
 			}
@@ -595,6 +588,7 @@ func readAlertsFromCSV(filename string, fuzzyMatching bool, substringRegexStr st
 			URL:               record[11],
 			Resolution:        record[12],
 			ResolutionComment: record[13],
+			Secret:            details.Secret,
 		}
 
 		if fuzzyMatching {
