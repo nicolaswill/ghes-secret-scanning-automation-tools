@@ -30,7 +30,7 @@ type AlertKey struct {
 
 // Secret scanning alert content, type, location, and path.
 type AlertDetails struct {
-	Secret       string
+	Secret       string // might be parsed or empty if substringRegex or fuzzyMatching is used
 	LocationType string
 	CommitSHA    string
 	StartColumn  int
@@ -45,7 +45,7 @@ type AlertState struct {
 	URL               string
 	Resolution        string
 	ResolutionComment string
-	Secret            string
+	Secret            string // actual secret content
 }
 
 // Map of repo name to alert details to alert state
@@ -335,17 +335,17 @@ func retrieveAlertsAndLocations(ctx context.Context, params AlertRetrievalParams
 
 	// Get all alerts for the old and new patterns.
 	if params.EnterpriseName != "" {
-		log.Printf("Getting alerts for enterprise %s\n", params.EnterpriseName)
+		log.Printf("Getting %s alerts for enterprise %s\n", params.PatternID, params.EnterpriseName)
 		err := getEnterpriseSecretScanningAlerts(ctx, client, params.EnterpriseName, params.PatternID, alertListOptions, alertsByRepoKey)
 		if err != nil {
-			return nil, fmt.Errorf("error getting old pattern alerts for enterprise %s: %s", params.EnterpriseName, err)
+			return nil, fmt.Errorf("error getting alerts for enterprise %s: %s", params.EnterpriseName, err)
 		}
 	} else if len(*params.OrganizationIDs) > 0 {
 		for _, orgID := range *params.OrganizationIDs {
-			log.Printf("Getting alerts for organization %s\n", orgID)
+			log.Printf("Getting %s alerts for organization %s\n", params.PatternID, orgID)
 			err := getOrganizationSecretScanningAlerts(ctx, client, orgID, params.PatternID, alertListOptions, alertsByRepoKey)
 			if err != nil {
-				return nil, fmt.Errorf("error getting old pattern alerts for organization %s: %s", orgID, err)
+				return nil, fmt.Errorf("error getting alerts for organization %s: %s", orgID, err)
 			}
 		}
 	} else if len(*params.RepositoryIDs) > 0 {
@@ -355,10 +355,10 @@ func retrieveAlertsAndLocations(ctx context.Context, params AlertRetrievalParams
 				return nil, fmt.Errorf("repositoryID %s is invalid. Must be in the format owner/name", repoID)
 			}
 			repoKey := RepoKey{Owner: splitRepoID[0], Name: splitRepoID[1]}
-			log.Printf("Getting alerts for repository %s\n", repoID)
+			log.Printf("Getting %s alerts for repository %s\n", params.PatternID, repoID)
 			err := getRepositorySecretScanningAlerts(ctx, client, repoKey, params.PatternID, alertListOptions, alertsByRepoKey)
 			if err != nil {
-				return nil, fmt.Errorf("error getting old pattern alerts for repository %s: %s", repoID, err)
+				return nil, fmt.Errorf("error getting alerts for repository %s: %s", repoID, err)
 			}
 		}
 	} else {
@@ -803,11 +803,9 @@ func main() {
 				return err
 			}
 
-			var oldAlerts RepoKeyToAlertDetailsToAlertState
-
 			// Mode 1: Output old alerts to CSV
 			if outputOldAlerts {
-				oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
+				oldAlerts, err := retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
 				if err != nil {
 					return err
 				}
@@ -825,35 +823,54 @@ func main() {
 
 			log.Printf("Beginning secret scanning pattern migration.\n")
 
-			if oldAlertsCsv != "" {
-				log.Printf("Populating old alerts from CSV.\n")
-				oldAlerts, err = readAlertsFromCSV(oldAlertsCsv, fuzzyMatching, oldSubstringRegex)
-				if err != nil {
-					return err
-				}
-			} else {
-				oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
-				if err != nil {
-					return err
-				}
-			}
-
-			// Mode 3: Retrieve old alerts from GitHub
-			newAlertRetrievealParams := AlertRetrievalParams{
-				EnterpriseName:  enterpriseId,
-				OrganizationIDs: &organizationIDs,
-				RepositoryIDs:   &repositoryIDs,
-				PatternID:       newSecretPattern,
-				SubstringRegex:  newSubstringRegex,
-				FuzzyMatching:   fuzzyMatching,
-				AlertState:      "open",
-			}
-
+			var wg sync.WaitGroup
+			errorsChan := make(chan error, 2)
+			var oldAlerts RepoKeyToAlertDetailsToAlertState
 			var newAlerts RepoKeyToAlertDetailsToAlertState
-			newAlerts, err = retrieveAlertsAndLocations(ctx, newAlertRetrievealParams, client)
 
-			if err != nil {
-				return err
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var err error
+				if oldAlertsCsv != "" {
+					log.Printf("Populating old alerts from CSV.\n")
+					oldAlerts, err = readAlertsFromCSV(oldAlertsCsv, fuzzyMatching, oldSubstringRegex)
+				} else {
+					oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
+				}
+				if err != nil {
+					errorsChan <- err
+					return
+				}
+			}()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				newAlertRetrievalParams := AlertRetrievalParams{
+					EnterpriseName:  enterpriseId,
+					OrganizationIDs: &organizationIDs,
+					RepositoryIDs:   &repositoryIDs,
+					PatternID:       newSecretPattern,
+					SubstringRegex:  newSubstringRegex,
+					FuzzyMatching:   fuzzyMatching,
+					AlertState:      "open",
+				}
+				var err error
+				newAlerts, err = retrieveAlertsAndLocations(ctx, newAlertRetrievalParams, client)
+				if err != nil {
+					errorsChan <- err
+					return
+				}
+			}()
+
+			wg.Wait()
+			close(errorsChan)
+
+			for err := range errorsChan {
+				if err != nil {
+					return err
+				}
 			}
 
 			resolutionParams := AlertResolutionParams{
