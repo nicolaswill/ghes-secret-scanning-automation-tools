@@ -109,16 +109,18 @@ func reopenClosedAlertsFromCSV(ctx context.Context, reopenAlertsCSVPath string, 
 
 func adjustAlertDetailsWithSubstringRegex(substringRegex *regexp.Regexp, details *AlertDetails, state *AlertState) {
 	if substringRegex != nil {
-		if details.StartLine != details.EndLine {
-			log.Printf("Warning: startline and endline are different for alert %s. Multiline alerts are not yet supported.\n", state.URL)
-		} else {
-			// get the string index of the first group of the regex
-			substringIndex := substringRegex.FindStringSubmatchIndex(details.Secret)
-			if len(substringIndex) >= 4 && substringIndex[3]-substringIndex[2] > 0 {
+		// get the string index of the first group of the regex
+		substringIndex := substringRegex.FindStringSubmatchIndex(details.Secret)
+		if len(substringIndex) >= 4 && substringIndex[3]-substringIndex[2] > 0 {
+			if details.StartLine == details.EndLine {
 				details.EndColumn = substringIndex[3] + details.StartColumn
 				details.StartColumn += substringIndex[2]
-				details.Secret = details.Secret[substringIndex[2]:substringIndex[3]]
+			} else {
+				log.Printf("Warning: startline and endline are different for alert %s. Ignoring column start/end.\n", state.URL)
+				details.EndColumn = 0
+				details.StartColumn = 0
 			}
+			details.Secret = details.Secret[substringIndex[2]:substringIndex[3]]
 		}
 	}
 }
@@ -723,11 +725,6 @@ func main() {
 				return nil
 			}
 
-			if alertsCsv == "" && (oldSecretPattern == "" || newSecretPattern == "") {
-				log.Fatalf("Must specify at least alerts-csv or old-secret-pattern and new-secret-pattern.")
-				return nil
-			}
-
 			// Do not allow old and new secret patterns to be the same
 			if oldSecretPattern == newSecretPattern {
 				log.Fatalf("Old and new secret patterns cannot be the same.")
@@ -746,7 +743,7 @@ func main() {
 			log.Printf("Fuzzy Matching: %v\n", fuzzyMatching)
 			log.Printf("Output Old Alerts: %v\n", outputOldAlerts)
 			log.Printf("Old Alerts CSV Path: %s\n", oldAlertsCsv)
-			log.Printf("Alerts CSV Path: %s\n", alertsCsv)
+			log.Printf("Alerts to Reopen CSV Path: %s\n", alertsCsv)
 
 			// Setup the client
 			ctx := context.Background()
