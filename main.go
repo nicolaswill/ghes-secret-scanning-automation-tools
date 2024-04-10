@@ -12,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/google/go-github/v57/github"
 	"github.com/urfave/cli/v2"
@@ -171,12 +174,14 @@ func getSecretScanningAlertLocations(ctx context.Context, client *github.Client,
 
 	var wg sync.WaitGroup
 	var mutex sync.RWMutex
-	semaphore := make(chan struct{}, 64) // up to 64 concurrent goroutines
+	semaphore := make(chan struct{}, 15) // up to 15 concurrent goroutines
 
 	var substringRegex *regexp.Regexp = nil
 	if secretSubstringRegex != "" {
 		substringRegex = regexp.MustCompile(secretSubstringRegex)
 	}
+
+	limiter := rate.NewLimiter(15, 15) // max 15 requests per second to respect secondary rate limit (900 per minute)
 
 	for repo, alerts := range alertsByRepoName {
 		for _, alert := range alerts {
@@ -187,6 +192,7 @@ func getSecretScanningAlertLocations(ctx context.Context, client *github.Client,
 				defer func() { <-semaphore }()
 				locationOpts := github.ListOptions{PerPage: 100, Page: 1}
 				for {
+					limiter.Wait(ctx) // wait for rate limiter
 					locations, resp, err := client.SecretScanning.ListLocationsForAlert(ctx, repo.Owner, repo.Name, int64(alert.GetNumber()), &locationOpts)
 					if err != nil {
 						return
@@ -218,7 +224,9 @@ func getSecretScanningAlertLocations(ctx context.Context, client *github.Client,
 }
 
 func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Client, enterpriseName string, pattern string, opts github.SecretScanningAlertListOptions, output map[RepoKey][]*github.SecretScanningAlert) error {
+	limiter := rate.NewLimiter(15, 15) // max 15 requests per second to respect secondary rate limit (900 per minute)
 	for {
+		limiter.Wait(ctx) // wait for rate limiter
 		alerts, resp, err := client.SecretScanning.ListAlertsForEnterprise(ctx, enterpriseName, &opts)
 		if err != nil {
 			return err
@@ -237,7 +245,9 @@ func getEnterpriseSecretScanningAlerts(ctx context.Context, client *github.Clien
 }
 
 func getOrganizationSecretScanningAlerts(ctx context.Context, client *github.Client, orgName string, pattern string, opts github.SecretScanningAlertListOptions, output map[RepoKey][]*github.SecretScanningAlert) error {
+	limiter := rate.NewLimiter(15, 15) // max 15 requests per second to respect secondary rate limit (900 per minute)
 	for {
+		limiter.Wait(ctx) // wait for rate limiter
 		alerts, resp, err := client.SecretScanning.ListAlertsForOrg(ctx, orgName, &opts)
 		if err != nil {
 			return err
@@ -255,7 +265,9 @@ func getOrganizationSecretScanningAlerts(ctx context.Context, client *github.Cli
 }
 
 func getRepositorySecretScanningAlerts(ctx context.Context, client *github.Client, repo RepoKey, pattern string, opts github.SecretScanningAlertListOptions, output map[RepoKey][]*github.SecretScanningAlert) error {
+	limiter := rate.NewLimiter(15, 15) // max 15 requests per second to respect secondary rate limit (900 per minute)
 	for {
+		limiter.Wait(ctx) // wait for rate limiter
 		alerts, resp, err := client.SecretScanning.ListAlertsForRepo(ctx, repo.Owner, repo.Name, &opts)
 		if err != nil {
 			return err
@@ -368,7 +380,9 @@ func retrieveAlertsAndLocations(ctx context.Context, params AlertRetrievalParams
 	}
 
 	// Loop through all repos in the output and remove any that are disabled
+	limiter := rate.NewLimiter(15, 15) // max 15 requests per second to respect secondary rate limit (900 per minute)
 	for repoKey := range alertsByRepoKey {
+		limiter.Wait(ctx) // wait for rate limiter
 		_, resp, err := client.Repositories.Get(ctx, repoKey.Owner, repoKey.Name)
 		if err != nil && resp.StatusCode == 403 && strings.Contains(err.Error(), "Repository access blocked") {
 			log.Printf("Warning: repository %s/%s is disabled\n", repoKey.Owner, repoKey.Name)
@@ -442,7 +456,8 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	semaphore := make(chan struct{}, 64)
+	semaphore := make(chan struct{}, 3) // max 3 concurrent goroutines
+	limiter := rate.NewLimiter(3, 3)    // max 3 requests per second
 
 	for _, info := range alertsToResolve {
 		wg.Add(1)
@@ -462,6 +477,7 @@ func resolveAlreadyTriagedAlerts(ctx context.Context, params AlertResolutionPara
 					Resolution:        &info.OldAlert.Resolution,
 					ResolutionComment: &info.OldAlert.ResolutionComment,
 				}
+				limiter.Wait(ctx) // wait for rate limiter
 				_, _, err := UpdateAlertInternal(
 					ctx,
 					client,
@@ -820,54 +836,35 @@ func main() {
 
 			log.Printf("Beginning secret scanning pattern migration.\n")
 
-			var wg sync.WaitGroup
-			errorsChan := make(chan error, 2)
 			var oldAlerts RepoKeyToAlertDetailsToAlertState
 			var newAlerts RepoKeyToAlertDetailsToAlertState
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				var err error
-				if oldAlertsCsv != "" {
-					log.Printf("Populating old alerts from CSV.\n")
-					oldAlerts, err = readAlertsFromCSV(oldAlertsCsv, fuzzyMatching, oldSubstringRegex)
-				} else {
-					oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
-				}
-				if err != nil {
-					errorsChan <- err
-					return
-				}
-			}()
+			if oldAlertsCsv != "" {
+				log.Printf("Populating old alerts from CSV.\n")
+				oldAlerts, err = readAlertsFromCSV(oldAlertsCsv, fuzzyMatching, oldSubstringRegex)
+			} else {
+				oldAlerts, err = retrieveAlertsAndLocations(ctx, oldAlertRetrievalParams, client)
+				log.Printf("Waiting for 1 minute before retrieving new alerts.\n")
+				time.Sleep(time.Minute)
+			}
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				newAlertRetrievalParams := AlertRetrievalParams{
-					EnterpriseName:  enterpriseId,
-					OrganizationIDs: &organizationIDs,
-					RepositoryIDs:   &repositoryIDs,
-					PatternID:       newSecretPattern,
-					SubstringRegex:  newSubstringRegex,
-					FuzzyMatching:   fuzzyMatching,
-					AlertState:      "open",
-				}
-				var err error
-				newAlerts, err = retrieveAlertsAndLocations(ctx, newAlertRetrievalParams, client)
-				if err != nil {
-					errorsChan <- err
-					return
-				}
-			}()
+			if err != nil {
+				return err
+			}
 
-			wg.Wait()
-			close(errorsChan)
+			newAlertRetrievalParams := AlertRetrievalParams{
+				EnterpriseName:  enterpriseId,
+				OrganizationIDs: &organizationIDs,
+				RepositoryIDs:   &repositoryIDs,
+				PatternID:       newSecretPattern,
+				SubstringRegex:  newSubstringRegex,
+				FuzzyMatching:   fuzzyMatching,
+				AlertState:      "open",
+			}
+			newAlerts, err = retrieveAlertsAndLocations(ctx, newAlertRetrievalParams, client)
 
-			for err := range errorsChan {
-				if err != nil {
-					return err
-				}
+			if err != nil {
+				return err
 			}
 
 			resolutionParams := AlertResolutionParams{
